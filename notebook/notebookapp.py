@@ -44,11 +44,6 @@ from jinja2 import Environment, FileSystemLoader
 
 from notebook.transutils import trans, _
 
-# Install the pyzmq ioloop. This has to be done before anything else from
-# tornado is imported.
-from zmq.eventloop import ioloop
-ioloop.install()
-
 # check for tornado 3.1.0
 try:
     import tornado
@@ -62,6 +57,7 @@ if version_info < (5,0):
     raise ImportError(_("The Jupyter Notebook requires tornado >= 5.0, but you have %s") % tornado.version)
 
 from tornado import httpserver
+from tornado import ioloop
 from tornado import web
 from tornado.httputil import url_concat
 from tornado.log import LogFormatter, app_log, access_log, gen_log
@@ -121,6 +117,7 @@ from .utils import (
     urlencode_unix_socket_path,
     urljoin,
 )
+from .traittypes import TypeFromClasses
 
 # Check if we can use async kernel management
 try:
@@ -1379,12 +1376,40 @@ class NotebookApp(JupyterApp):
         (shutdown the notebook server)."""
     )
 
-    contents_manager_class = Type(
+    # We relax this trait to handle Contents Managers using jupyter_server
+    # as the core backend.
+    contents_manager_class = TypeFromClasses(
         default_value=LargeFileManager,
-        klass=ContentsManager,
+        klasses=[
+            ContentsManager,
+            # To make custom ContentsManagers both forward+backward
+            # compatible, we'll relax the strictness of this trait
+            # and allow jupyter_server contents managers to pass
+            # through. If jupyter_server is not installed, this class
+            # will be ignored.
+            'jupyter_server.contents.services.managers.ContentsManager'
+        ],
         config=True,
         help=_('The notebook manager class to use.')
     )
+
+    # Throws a deprecation warning to jupyter_server based contents managers.
+    @observe('contents_manager_class')
+    def _observe_contents_manager_class(self, change):
+        new = change['new']
+        # If 'new' is a class, get a string representing the import
+        # module path.
+        if inspect.isclass(new):
+            new = new.__module__
+
+        if new.startswith('jupyter_server'):
+            self.log.warning(
+                "The specified 'contents_manager_class' class inherits a manager from the "
+                "'jupyter_server' package. These (future-looking) managers are not "
+                "guaranteed to work with the 'notebook' package. For longer term support "
+                "consider switching to NBClassic—a notebook frontend that leverages "
+                "Jupyter Server as its server backend."
+            )
 
     kernel_manager_class = Type(
         default_value=MappingKernelManager,
@@ -1559,6 +1584,21 @@ class NotebookApp(JupyterApp):
         """
     ).tag(config=True)
 
+    @default('authenticate_prometheus')
+    def _default_authenticate_prometheus(self):
+        """ Authenticate Prometheus by default, unless auth is disabled. """
+        auth = bool(self.password) or bool(self.token)
+        if auth is False:
+            self.log.info(_("Authentication of /metrics is OFF, since other authentication is disabled."))
+        return auth
+
+    @observe('authenticate_prometheus')
+    def _update_authenticate_prometheus(self, change):
+        newauth = change['new']
+        if self.authenticate_prometheus is True and newauth is False:
+            self.log.info(_("Authentication of /metrics is being turned OFF."))
+        self.authenticate_prometheus = newauth
+
     # Since use of terminals is also a function of whether the terminado package is
     # available, this variable holds the "final indication" of whether terminal functionality
     # should be considered (particularly during shutdown/cleanup).  It is enabled only
@@ -1611,9 +1651,6 @@ class NotebookApp(JupyterApp):
         )
         #  Ensure the appropriate version of Python and jupyter_client is available.
         if isinstance(self.kernel_manager, AsyncMappingKernelManager):
-            if sys.version_info < (3, 6):  # Can be removed once 3.5 is dropped.
-                raise ValueError("You are using `AsyncMappingKernelManager` in Python 3.5 (or lower) "
-                                 "which is not supported. Please upgrade Python to 3.6+ or change kernel managers.")
             if not async_kernel_mgmt_available:  # Can be removed once jupyter_client >= 6.1 is required.
                 raise ValueError("You are using `AsyncMappingKernelManager` without an appropriate "
                                  "jupyter_client installed!  Please upgrade jupyter_client or change kernel managers.")
@@ -1906,6 +1943,13 @@ class NotebookApp(JupyterApp):
         """
         info = self.log.info
         info(_('interrupted'))
+        # Check if answer_yes is set
+        if self.answer_yes:
+            self.log.critical(_("Shutting down..."))
+            # schedule stop on the main thread,
+            # since this might be called from a signal handler
+            self.io_loop.add_callback_from_signal(self.io_loop.stop)
+            return
         print(self.notebook_info())
         yes = _('y')
         no = _('n')
